@@ -10,6 +10,11 @@ from app.models import (
     OperationData, Annotation, RobotModel, Scene
 )
 from app.services.aggregation import compute_dataset_quality_stats
+from app.events import (
+    EVENT_DATASET_PUBLISHED,
+    EVENT_DATASET_VERSION_REVOKED,
+)
+from app.events.outbox import record_event, utc_now
 from app.schemas.dataset import (
     DatasetCreate, DatasetUpdate, DatasetResponse,
     DatasetItemAddRequest, DatasetItemRemoveRequest,
@@ -77,23 +82,49 @@ def _create_version_snapshot(db: Session, dataset: Dataset, change_description: 
     return version
 
 
-def _notify_subscribers(db: Session, dataset: Dataset, version: DatasetVersion):
-    subscriptions = db.query(DatasetSubscription).filter(
-        DatasetSubscription.dataset_id == dataset.id,
-        DatasetSubscription.notify_on_new_version == True
-    ).all()
+def _record_published_event(db: Session, dataset: Dataset, version: DatasetVersion, published_at: datetime):
+    """在当前事务中登记“数据集发布”事件（不提交）。
 
-    notifications = []
-    for sub in subscriptions:
-        notifications.append({
-            "subscriber_team": sub.subscriber_team,
-            "contact_person": sub.contact_person,
-            "dataset_id": dataset.id,
-            "dataset_name": dataset.name,
-            "new_version": version.version_label,
-            "message": f"数据集 '{dataset.name}' 已发布新版本 {version.version_label}"
-        })
-    return notifications
+    载荷只含分析所需字段，contact_person、reviewer 等个人信息
+    由事件契约白名单统一排除。
+    """
+    record_event(
+        db,
+        EVENT_DATASET_PUBLISHED,
+        aggregate_type="dataset",
+        aggregate_id=dataset.id,
+        dataset_id=dataset.id,
+        dataset_name=dataset.name,
+        version_label=version.version_label,
+        version_number=version.version_number,
+        robot_model_id=dataset.robot_model_id,
+        scene_id=dataset.scene_id,
+        skill_id=dataset.skill_id,
+        owner_team=dataset.owner_team,
+        total_items=dataset.total_items,
+        success_count=dataset.success_count,
+        failure_count=dataset.failure_count,
+        annotation_complete_rate=dataset.annotation_complete_rate,
+        average_quality_score=dataset.average_quality_score,
+        data_grade=dataset.data_grade,
+        published_at=published_at.isoformat(),
+    )
+
+
+def _record_version_revoked_event(db: Session, dataset: Dataset, revoked_at: datetime):
+    """在当前事务中登记“版本撤回”事件（不提交）。"""
+    record_event(
+        db,
+        EVENT_DATASET_VERSION_REVOKED,
+        aggregate_type="dataset",
+        aggregate_id=dataset.id,
+        dataset_id=dataset.id,
+        dataset_name=dataset.name,
+        version_label=dataset.version,
+        version_number=dataset.current_version,
+        reused_at_release=(dataset.reuse_count or 0) > 0,
+        revoked_at=revoked_at.isoformat(),
+    )
 
 
 @router.get("/datasets", response_model=List[DatasetResponse], tags=["数据集管理"])
@@ -326,14 +357,15 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
         dataset.current_version = version.version_number
         dataset.version = version.version_label
 
+        published_at = utc_now()
         dataset.is_published = True
-        dataset.published_at = datetime.now(timezone.utc)
+        dataset.published_at = published_at
 
         review.dataset_version_id = version.id
         db.flush()
 
-        db.refresh(dataset)
-        _notify_subscribers(db, dataset, version)
+        # 业务写入与事件登记在同一事务：提交则一起生效，回滚则一起消失
+        _record_published_event(db, dataset, version, published_at)
         db.commit()
         db.refresh(review)
         return review
@@ -346,6 +378,8 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
         dataset.review_status = "draft"
         dataset.is_published = False
         dataset.published_at = None
+        # version / current_version 保留被撤回的版本号，事件据此记录
+        _record_version_revoked_event(db, dataset, utc_now())
 
     review = DatasetReview(
         dataset_id=dataset.id,

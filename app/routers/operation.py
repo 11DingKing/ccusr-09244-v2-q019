@@ -8,8 +8,10 @@ from app.models import OperationData, RobotModel, Scene, Skill, Annotation
 from app.schemas.operation import (
     OperationDataCreate, OperationDataUpdate, OperationDataResponse,
     OperationDataListResponse, BatchOperationResponse, BatchOperationResultItem,
-    AnnotationCreate, AnnotationUpdate, AnnotationResponse
+    AnnotationCreate, AnnotationUpdate, AnnotationResponse, AnnotationApproveRequest
 )
+from app.events import EVENT_ANNOTATION_APPROVED
+from app.events.outbox import record_event, utc_now
 
 router = APIRouter()
 
@@ -261,6 +263,48 @@ def delete_annotation(annotation_id: int, db: Session = Depends(get_db)):
     db.delete(annotation)
     db.commit()
     return {"message": "删除成功"}
+
+
+@router.post("/annotations/{annotation_id}/approve", response_model=AnnotationResponse, tags=["标注管理"])
+def approve_annotation(annotation_id: int, req: AnnotationApproveRequest, db: Session = Depends(get_db)):
+    annotation = db.query(Annotation).filter(Annotation.id == annotation_id).first()
+    if not annotation:
+        raise HTTPException(status_code=404, detail="标注记录不存在")
+    if annotation.review_status == "approved":
+        raise HTTPException(status_code=400, detail="标注已批准，请勿重复操作")
+
+    operation = db.query(OperationData).filter(
+        OperationData.id == annotation.operation_data_id
+    ).first()
+    if not operation:
+        raise HTTPException(status_code=400, detail="关联的作业数据不存在")
+
+    approved_at = utc_now()
+    annotation.review_status = "approved"
+    annotation.reviewer = req.reviewer
+    annotation.review_notes = req.review_notes
+
+    # 业务更新与事件登记同事务；载荷经契约白名单过滤，
+    # annotator/reviewer/review_notes/failure_description 均不外泄
+    record_event(
+        db,
+        EVENT_ANNOTATION_APPROVED,
+        aggregate_type="annotation",
+        aggregate_id=annotation.id,
+        annotation_id=annotation.id,
+        operation_data_id=annotation.operation_data_id,
+        robot_model_id=operation.robot_model_id,
+        scene_id=operation.scene_id,
+        skill_id=operation.skill_id,
+        is_success=annotation.is_success,
+        failure_category=annotation.failure_category,
+        failure_subcategory=annotation.failure_subcategory,
+        annotation_quality_score=annotation.annotation_quality_score,
+        approved_at=approved_at.isoformat(),
+    )
+    db.commit()
+    db.refresh(annotation)
+    return annotation
 
 
 FAILURE_CATEGORIES = [

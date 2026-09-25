@@ -1,8 +1,39 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
+from datetime import datetime, timezone
+
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from sqlalchemy.types import TypeDecorator
 
 from app.database import Base
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+class TZDateTime(TypeDecorator):
+    """以 UTC 持久化、读回始终带 tzinfo 的时间类型。
+
+    SQLite 底层不保留时区，pysqlite 会剥离 tzinfo；这里在绑定参数时
+    统一转成 UTC，在读回时把 naive 值解释为 UTC，保证发件箱内所有
+    时间比较（尤其是可注入时钟驱动的领取/退避判断）时区一致。
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None:
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
 
 
 class RobotModel(Base):
@@ -224,3 +255,95 @@ class DatasetSubscription(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     dataset = relationship("Dataset", back_populates="subscriptions")
+
+
+class OutboxEvent(Base):
+    """持久化发件箱：与业务数据在同一事务写入。
+
+    生命周期：pending（待派发）→ processing（已被领取）→
+    delivered（消费者确认）；重试耗尽后进入 dead_letter，
+    可通过管理接口查询并手动重投。
+    """
+
+    __tablename__ = "outbox_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(String(100), nullable=False, index=True)
+    aggregate_type = Column(String(50), nullable=False, index=True)
+    aggregate_id = Column(String(100), nullable=False, index=True)
+    #: 稳定载荷版本，与 event_type 一起决定消费契约
+    payload_version = Column(String(20), nullable=False)
+    payload = Column(JSON, nullable=False)
+
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=10)
+    available_at = Column(TZDateTime, nullable=False, index=True)
+    locked_at = Column(TZDateTime, nullable=True)
+    locked_by = Column(String(100), nullable=True)
+    last_error = Column(Text, nullable=True)
+    dead_letter_reason = Column(Text, nullable=True)
+
+    created_at = Column(TZDateTime, nullable=False, default=_utc_now, index=True)
+    delivered_at = Column(TZDateTime, nullable=True)
+    dead_letter_at = Column(TZDateTime, nullable=True)
+
+    attempts = relationship(
+        "OutboxDeliveryAttempt",
+        back_populates="event",
+        cascade="all, delete-orphan",
+        order_by="OutboxDeliveryAttempt.attempt_number",
+    )
+
+
+class OutboxDeliveryAttempt(Base):
+    """每次派发尝试的留痕：成功与失败均记录。"""
+
+    __tablename__ = "outbox_delivery_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(Integer, ForeignKey("outbox_events.id"), nullable=False, index=True)
+    attempt_number = Column(Integer, nullable=False)
+    status = Column(String(20), nullable=False, index=True)
+    consumer = Column(String(100), nullable=True)
+    error = Column(Text, nullable=True)
+    next_available_at = Column(TZDateTime, nullable=True)
+    created_at = Column(TZDateTime, nullable=False, default=_utc_now)
+
+    event = relationship("OutboxEvent", back_populates="attempts")
+
+
+class InboxEventConfirmation(Base):
+    """消费者处理幂等记录：同一 event_id + consumer 只生效一次。"""
+
+    __tablename__ = "inbox_event_confirmations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(Integer, ForeignKey("outbox_events.id"), nullable=False)
+    consumer = Column(String(100), nullable=False)
+    confirmed_at = Column(TZDateTime, nullable=False, default=_utc_now)
+
+    __table_args__ = (
+        # 消费者重复确认同一事件必须在数据库层面也被拒绝
+        UniqueConstraint("event_id", "consumer", name="uq_inbox_event_consumer"),
+    )
+
+
+class AnalysisEventLog(Base):
+    """内部分析组件消费事件后的投影记录（消费者侧效果留痕）。
+
+    event_id 唯一约束与 inbox 确认一起构成双保险：即使同一事件
+    被重复投递/重复确认，投影也只会落一行。
+    """
+
+    __tablename__ = "analysis_event_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(Integer, ForeignKey("outbox_events.id"), nullable=False, unique=True, index=True)
+    event_type = Column(String(100), nullable=False, index=True)
+    payload_version = Column(String(20), nullable=False)
+    aggregate_type = Column(String(50), nullable=False)
+    aggregate_id = Column(String(100), nullable=False, index=True)
+    payload = Column(JSON, nullable=False)
+    consumer = Column(String(100), nullable=False)
+    consumed_at = Column(TZDateTime, nullable=False, default=_utc_now)

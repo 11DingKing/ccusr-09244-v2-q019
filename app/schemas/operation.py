@@ -112,6 +112,11 @@ class AnnotationUpdate(BaseModel):
     annotation_quality_score: Optional[float] = None
 
 
+class AnnotationApproveRequest(BaseModel):
+    reviewer: Optional[str] = Field(None, max_length=100, description="审核人（不进入事件载荷）")
+    review_notes: Optional[str] = Field(None, description="审核意见（不进入事件载荷）")
+
+
 class AnnotationResponse(BaseModel):
     id: int
     operation_data_id: int

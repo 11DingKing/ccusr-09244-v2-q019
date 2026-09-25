@@ -1,9 +1,13 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import engine, Base
-from app.routers import common, operation, dataset, analytics
+from app.database import engine, Base, SessionLocal
+from app.routers import common, operation, dataset, analytics, outbox
+from app.events import build_dispatcher
+from app.events.dispatcher import BackgroundDispatcher
 
 
 def create_tables():
@@ -17,9 +21,34 @@ def create_tables():
 
 create_tables()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    background = None
+    if settings.OUTBOX_AUTO_DISPATCH:
+        dispatcher = build_dispatcher(
+            SessionLocal,
+            consumer_name=settings.OUTBOX_CONSUMER_NAME,
+            batch_size=settings.OUTBOX_BATCH_SIZE,
+            base_retry_delay=settings.OUTBOX_RETRY_BASE_SECONDS,
+            backoff_factor=settings.OUTBOX_RETRY_FACTOR,
+            max_retry_delay=settings.OUTBOX_RETRY_MAX_SECONDS,
+        )
+        background = BackgroundDispatcher(
+            dispatcher, poll_interval=settings.OUTBOX_POLL_INTERVAL
+        )
+        background.start()
+    try:
+        yield
+    finally:
+        if background is not None:
+            background.stop()
+
+
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
+    lifespan=lifespan,
     description="""
 # 机器人真机作业数据回流后端服务
 
@@ -85,6 +114,7 @@ app.include_router(common.router, prefix=api_prefix)
 app.include_router(operation.router, prefix=api_prefix)
 app.include_router(dataset.router, prefix=api_prefix)
 app.include_router(analytics.router, prefix=api_prefix)
+app.include_router(outbox.router, prefix=api_prefix)
 
 
 @app.get("/", tags=["首页"])

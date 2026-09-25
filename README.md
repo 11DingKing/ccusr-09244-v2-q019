@@ -6,8 +6,9 @@
 
 - `main.py`：应用入口、健康检查和路由注册。
 - `app/models`：业务实体及其关系。
-- `app/routers`：基础资源、作业、数据集和分析接口。
-- `app/services`：评分、统计、策略目录与时间窗口工具。
+- `app/routers`：基础资源、作业、数据集、分析与发件箱管理接口。
+- `app/services`：评分、统计、策略目录、时间窗口工具与发件箱管理服务。
+- `app/events`：持久化发件箱——事件契约、同事务写入、进程内派发器与幂等消费者。
 - `app/seed_data.py`：可重复执行的示例数据初始化逻辑。
 - `scripts/init_sample_data.py`：初始化脚本的兼容入口。
 
