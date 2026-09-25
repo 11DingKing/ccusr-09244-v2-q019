@@ -10,6 +10,13 @@ from app.models import (
     OperationData, Annotation, RobotModel, Scene
 )
 from app.services.aggregation import compute_dataset_quality_stats
+from app.services.outbox import (
+    DATASET_PUBLISHED,
+    DATASET_VERSION_REVOKED,
+    build_dataset_published_payload,
+    build_version_revoked_payload,
+    record_event,
+)
 from app.schemas.dataset import (
     DatasetCreate, DatasetUpdate, DatasetResponse,
     DatasetItemAddRequest, DatasetItemRemoveRequest,
@@ -77,23 +84,26 @@ def _create_version_snapshot(db: Session, dataset: Dataset, change_description: 
     return version
 
 
-def _notify_subscribers(db: Session, dataset: Dataset, version: DatasetVersion):
-    subscriptions = db.query(DatasetSubscription).filter(
+def _subscriber_teams(db: Session, dataset: Dataset) -> list:
+    rows = db.query(DatasetSubscription.subscriber_team).filter(
         DatasetSubscription.dataset_id == dataset.id,
         DatasetSubscription.notify_on_new_version == True
     ).all()
+    return [row[0] for row in rows]
 
-    notifications = []
-    for sub in subscriptions:
-        notifications.append({
-            "subscriber_team": sub.subscriber_team,
-            "contact_person": sub.contact_person,
-            "dataset_id": dataset.id,
-            "dataset_name": dataset.name,
-            "new_version": version.version_label,
-            "message": f"数据集 '{dataset.name}' 已发布新版本 {version.version_label}"
-        })
-    return notifications
+
+def _record_published_event(db: Session, dataset: Dataset, version_number: int, version_label: str):
+    """在业务事务内记录数据集发布事件（替代原先请求路径上的直接通知）。"""
+    record_event(
+        db,
+        DATASET_PUBLISHED,
+        build_dataset_published_payload(
+            dataset,
+            version_number=version_number,
+            version_label=version_label,
+            subscriber_teams=_subscriber_teams(db, dataset),
+        ),
+    )
 
 
 @router.get("/datasets", response_model=List[DatasetResponse], tags=["数据集管理"])
@@ -203,8 +213,11 @@ def update_dataset(dataset_id: int, data: DatasetUpdate, db: Session = Depends(g
             raise HTTPException(status_code=400, detail="数据集尚未通过审核，无法发布")
         update_data["published_at"] = datetime.now(timezone.utc)
 
+    newly_published = bool(update_data.get("is_published")) and not dataset.is_published
     for field, value in update_data.items():
         setattr(dataset, field, value)
+    if newly_published:
+        _record_published_event(db, dataset, dataset.current_version, dataset.version)
     db.commit()
     db.refresh(dataset)
     return dataset
@@ -333,7 +346,7 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
         db.flush()
 
         db.refresh(dataset)
-        _notify_subscribers(db, dataset, version)
+        _record_published_event(db, dataset, version.version_number, version.version_label)
         db.commit()
         db.refresh(review)
         return review
@@ -346,6 +359,7 @@ def review_dataset(dataset_id: int, req: DatasetReviewAction, db: Session = Depe
         dataset.review_status = "draft"
         dataset.is_published = False
         dataset.published_at = None
+        record_event(db, DATASET_VERSION_REVOKED, build_version_revoked_payload(dataset, "revoke"))
 
     review = DatasetReview(
         dataset_id=dataset.id,
@@ -382,6 +396,7 @@ def publish_dataset(dataset_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="数据集为空，无法发布")
     dataset.is_published = True
     dataset.published_at = datetime.now(timezone.utc)
+    _record_published_event(db, dataset, dataset.current_version, dataset.version)
     db.commit()
     db.refresh(dataset)
     return dataset
@@ -395,6 +410,7 @@ def unpublish_dataset(dataset_id: int, db: Session = Depends(get_db)):
     dataset.is_published = False
     dataset.published_at = None
     dataset.review_status = "draft"
+    record_event(db, DATASET_VERSION_REVOKED, build_version_revoked_payload(dataset, "unpublish"))
     db.commit()
     db.refresh(dataset)
     return dataset

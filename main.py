@@ -1,9 +1,19 @@
+import logging
+import threading
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import engine, Base
-from app.routers import common, operation, dataset, analytics
+from app.database import engine, Base, SessionLocal
+from app.routers import common, operation, dataset, analytics, outbox
+from app.services.analytics_consumer import AnalyticsConsumer
+from app.services.dispatcher import OutboxDispatcher
+
+logger = logging.getLogger(__name__)
+
+OUTBOX_DISPATCH_INTERVAL_SECONDS = 1.0
 
 
 def create_tables():
@@ -16,6 +26,41 @@ def create_tables():
 
 
 create_tables()
+
+
+class OutboxWorker:
+    """进程内后台派发线程：周期性领取发件箱事件并派发给分析消费者。"""
+
+    def __init__(self, interval_seconds: float = OUTBOX_DISPATCH_INTERVAL_SECONDS):
+        self._interval = interval_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="outbox-dispatcher", daemon=True)
+
+    def _run(self):
+        dispatcher = OutboxDispatcher(SessionLocal, AnalyticsConsumer(SessionLocal))
+        while not self._stop.is_set():
+            try:
+                dispatcher.dispatch_pending()
+            except Exception:  # noqa: BLE001 - 后台线程不允许因单轮失败退出
+                logger.exception("发件箱派发轮次失败")
+            self._stop.wait(self._interval)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    worker = OutboxWorker()
+    worker.start()
+    app.state.outbox_worker = worker
+    yield
+    worker.stop()
+
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -68,7 +113,8 @@ app = FastAPI(
 - 按审核状态统计（待审/已发布等）
     """,
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -85,6 +131,7 @@ app.include_router(common.router, prefix=api_prefix)
 app.include_router(operation.router, prefix=api_prefix)
 app.include_router(dataset.router, prefix=api_prefix)
 app.include_router(analytics.router, prefix=api_prefix)
+app.include_router(outbox.router, prefix=api_prefix)
 
 
 @app.get("/", tags=["首页"])

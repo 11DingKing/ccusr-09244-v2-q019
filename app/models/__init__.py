@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -224,3 +224,77 @@ class DatasetSubscription(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     dataset = relationship("Dataset", back_populates="subscriptions")
+
+
+class OutboxEvent(Base):
+    """持久化发件箱事件：与业务写入在同一事务落库，由进程内派发器异步派发。"""
+
+    __tablename__ = "outbox_events"
+
+    STATUS_PENDING = "pending"
+    STATUS_CLAIMED = "claimed"
+    STATUS_DELIVERED = "delivered"
+    STATUS_QUARANTINED = "quarantined"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(String(64), unique=True, nullable=False, index=True)
+    event_type = Column(String(100), nullable=False, index=True)
+    payload_version = Column(Integer, nullable=False)
+    payload = Column(JSON, nullable=False)
+
+    status = Column(String(20), nullable=False, default=STATUS_PENDING, index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=5)
+    available_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    claimed_by = Column(String(100), nullable=True)
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    attempt_records = relationship("OutboxAttempt", back_populates="event", cascade="all, delete-orphan")
+
+
+class OutboxAttempt(Base):
+    """一次派发尝试的结果记录。"""
+
+    __tablename__ = "outbox_attempts"
+
+    OUTCOME_SUCCESS = "success"
+    OUTCOME_FAILURE = "failure"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(String(64), ForeignKey("outbox_events.event_id"), nullable=False, index=True)
+    attempt_number = Column(Integer, nullable=False)
+    outcome = Column(String(20), nullable=False)
+    error = Column(Text, nullable=True)
+    attempted_at = Column(DateTime(timezone=True), nullable=False)
+
+    event = relationship("OutboxEvent", back_populates="attempt_records")
+
+
+class ConsumedEvent(Base):
+    """消费者确认记录：(event_id, consumer) 唯一，保证重复确认不产生二次影响。"""
+
+    __tablename__ = "consumed_events"
+    __table_args__ = (
+        UniqueConstraint("event_id", "consumer", name="uq_consumed_event_consumer"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(String(64), nullable=False, index=True)
+    consumer = Column(String(100), nullable=False)
+    consumed_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class AnalyticsProjection(Base):
+    """内部分析组件的消费投影，用于观察事件副作用是否只生效一次。"""
+
+    __tablename__ = "analytics_projection"
+
+    id = Column(Integer, primary_key=True, index=True)
+    metric = Column(String(120), unique=True, nullable=False, index=True)
+    value = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=True), nullable=False)

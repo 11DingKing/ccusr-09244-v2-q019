@@ -5,6 +5,11 @@ from sqlalchemy import func, and_
 
 from app.database import get_db
 from app.models import OperationData, RobotModel, Scene, Skill, Annotation
+from app.services.outbox import (
+    ANNOTATION_APPROVED,
+    build_annotation_approved_payload,
+    record_event,
+)
 from app.schemas.operation import (
     OperationDataCreate, OperationDataUpdate, OperationDataResponse,
     OperationDataListResponse, BatchOperationResponse, BatchOperationResultItem,
@@ -246,8 +251,15 @@ def update_annotation(annotation_id: int, data: AnnotationUpdate, db: Session = 
     if not annotation:
         raise HTTPException(status_code=404, detail="标注记录不存在")
     update_data = data.model_dump(exclude_unset=True)
+    becoming_approved = (
+        update_data.get("review_status") == "approved"
+        and annotation.review_status != "approved"
+    )
     for field, value in update_data.items():
         setattr(annotation, field, value)
+    if becoming_approved:
+        # 标注批准：与状态变更同一事务记录发件箱事件
+        record_event(db, ANNOTATION_APPROVED, build_annotation_approved_payload(annotation))
     db.commit()
     db.refresh(annotation)
     return annotation
